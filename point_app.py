@@ -1,23 +1,246 @@
 """
 TONYAポイント付与計算（Streamlit）
 
-起動: streamlit run point_app.py
+起動: python -m streamlit run point_app.py
+Streamlit Cloud: point_app.py のみでも動作（ロジック同梱）
 """
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
+from enum import Enum
+from typing import Literal
+
 import pandas as pd
 import streamlit as st
 
-from point_logic import (
-    CampaignConfig,
-    CampaignRounding,
-    LineInput,
-    OrderConfig,
-    RANK_RATES,
-    TaxExMethod,
-    calculate_order,
-)
+# ---------------------------------------------------------------------------
+# 計算ロジック（Streamlit Cloud 向けに同ファイルへ同梱）
+# ---------------------------------------------------------------------------
+
+
+class TaxExMethod(str, Enum):
+    DIVIDE_FLOOR = "divide_floor"
+    TAX_ROUND = "tax_round"
+    TAX_FLOOR = "tax_floor"
+    UNIT_TAX_ROUND = "unit_tax_round"
+
+
+class CampaignRounding(str, Enum):
+    NONE = "none"
+    FLOOR = "floor"
+    CEIL = "ceil"
+
+
+@dataclass
+class LineInput:
+    label: str = "商品"
+    tax_in_unit: int = 0
+    quantity: int = 1
+    tax_rate: float = 0.10
+    is_bargain: bool = False
+    is_non_product: bool = False
+    campaign_target: bool = False
+
+
+@dataclass
+class LineResult:
+    label: str
+    tax_in_line: int
+    tax_ex_line: int
+    normal_points: int
+    final_points: int
+    campaign_applied: bool
+    note: str = ""
+
+
+@dataclass
+class CampaignConfig:
+    enabled: bool = False
+    name: str = "ポイントアップ"
+    multiplier: float = 5.0
+    rounding: CampaignRounding = CampaignRounding.CEIL
+
+
+@dataclass
+class OrderConfig:
+    rank_rate: float = 0.03
+    min_tax_ex_yen: int = 100
+    tax_ex_method: TaxExMethod = TaxExMethod.UNIT_TAX_ROUND
+    bargain_discount_threshold: int = 100
+    points_used: int = 0
+    point_usage_basis: Literal["tax_in", "tax_ex"] = "tax_in"
+
+
+RANK_RATES: dict[str, float] = {
+    "ホワイト会員": 0.01,
+    "シルバー会員": 0.01,
+    "ゴールド会員": 0.02,
+    "ダイヤモンド会員": 0.03,
+}
+
+
+def _tax_exclusive_amount(tax_in: int, tax_rate: float, method: TaxExMethod) -> int:
+    if tax_in <= 0:
+        return 0
+    if tax_rate <= 0:
+        return tax_in
+    if method == TaxExMethod.DIVIDE_FLOOR:
+        return math.floor(tax_in / (1 + tax_rate))
+    tax_part = tax_in * tax_rate / (1 + tax_rate)
+    if method in (TaxExMethod.TAX_ROUND, TaxExMethod.UNIT_TAX_ROUND):
+        tax_yen = int(round(tax_part))
+    else:
+        tax_yen = math.floor(tax_part)
+    return tax_in - tax_yen
+
+
+def tax_exclusive_line(
+    tax_in_line: int,
+    tax_rate: float,
+    method: TaxExMethod,
+    *,
+    tax_in_unit: int = 0,
+    quantity: int = 1,
+) -> int:
+    if method == TaxExMethod.UNIT_TAX_ROUND and quantity > 0 and tax_in_unit > 0:
+        return sum(
+            _tax_exclusive_amount(tax_in_unit, tax_rate, TaxExMethod.UNIT_TAX_ROUND)
+            for _ in range(quantity)
+        )
+    return _tax_exclusive_amount(tax_in_line, tax_rate, method)
+
+
+def normal_points_on_line(tax_ex_line: int, rate: float, is_bargain: bool) -> int:
+    if is_bargain or tax_ex_line <= 0:
+        return 0
+    return math.floor(tax_ex_line * rate)
+
+
+def apply_campaign(normal_pts: int, campaign: CampaignConfig) -> int:
+    if not campaign.enabled or normal_pts <= 0:
+        return normal_pts
+    scaled = normal_pts * campaign.multiplier
+    if campaign.rounding == CampaignRounding.CEIL:
+        return math.ceil(scaled)
+    if campaign.rounding == CampaignRounding.FLOOR:
+        return math.floor(scaled)
+    return int(scaled)
+
+
+def apply_point_usage(
+    line_results: list[LineResult],
+    lines: list[LineInput],
+    order: OrderConfig,
+) -> list[LineResult]:
+    if order.points_used <= 0:
+        return line_results
+
+    if order.point_usage_basis == "tax_ex":
+        bases = [r.tax_ex_line for r in line_results]
+        total_base = sum(bases)
+    else:
+        bases = [li.tax_in_unit * li.quantity for li in lines]
+        total_base = sum(bases)
+
+    if total_base <= 0:
+        return line_results
+
+    remaining = max(0, total_base - order.points_used)
+    ratio = remaining / total_base
+
+    adjusted: list[LineResult] = []
+    for lr, base in zip(line_results, bases):
+        if base <= 0:
+            adjusted.append(lr)
+            continue
+        new_final = math.floor(lr.final_points * ratio)
+        note = lr.note
+        if order.points_used > 0:
+            usage_note = f"ポイント利用按分×{ratio:.4f}"
+            note = f"{note}; {usage_note}".strip("; ")
+        adjusted.append(
+            LineResult(
+                label=lr.label,
+                tax_in_line=lr.tax_in_line,
+                tax_ex_line=lr.tax_ex_line,
+                normal_points=lr.normal_points,
+                final_points=new_final,
+                campaign_applied=lr.campaign_applied,
+                note=note,
+            )
+        )
+    return adjusted
+
+
+def calculate_order(
+    lines: list[LineInput],
+    order: OrderConfig,
+    campaign: CampaignConfig,
+) -> tuple[list[LineResult], int, str]:
+    results: list[LineResult] = []
+    total_tax_ex = 0
+
+    for line in lines:
+        tax_in_line = line.tax_in_unit * line.quantity
+        tax_ex_line = tax_exclusive_line(
+            tax_in_line,
+            line.tax_rate,
+            order.tax_ex_method,
+            tax_in_unit=line.tax_in_unit,
+            quantity=line.quantity,
+        )
+        total_tax_ex += tax_ex_line
+
+        normal = normal_points_on_line(tax_ex_line, order.rank_rate, line.is_bargain)
+        campaign_on = campaign.enabled and line.campaign_target and not line.is_bargain
+        final = apply_campaign(normal, campaign) if campaign_on else normal
+
+        notes: list[str] = []
+        if line.is_bargain:
+            notes.append("バーゲン品（付与0）")
+        if line.is_non_product:
+            notes.append("商品外売上")
+        if campaign_on:
+            notes.append(f"{campaign.name}×{campaign.multiplier:g}")
+
+        results.append(
+            LineResult(
+                label=line.label,
+                tax_in_line=tax_in_line,
+                tax_ex_line=tax_ex_line,
+                normal_points=normal,
+                final_points=final,
+                campaign_applied=campaign_on,
+                note="; ".join(notes),
+            )
+        )
+
+    memo_parts: list[str] = []
+    if total_tax_ex < order.min_tax_ex_yen:
+        memo_parts.append(
+            f"税抜合計{total_tax_ex}円は最低購入金額{order.min_tax_ex_yen}円未満のため、付与対象外の可能性があります"
+        )
+        for i, lr in enumerate(results):
+            results[i] = LineResult(
+                label=lr.label,
+                tax_in_line=lr.tax_in_line,
+                tax_ex_line=lr.tax_ex_line,
+                normal_points=0,
+                final_points=0,
+                campaign_applied=lr.campaign_applied,
+                note=(lr.note + "; 最低金額未満").strip("; "),
+            )
+
+    results = apply_point_usage(results, lines, order)
+    total_pts = sum(r.final_points for r in results)
+    return results, total_pts, "; ".join(memo_parts)
+
+
+# ---------------------------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------------------------
 
 st.set_page_config(
     page_title="TONYAポイント付与計算",
